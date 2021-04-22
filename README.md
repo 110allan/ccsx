@@ -1,26 +1,26 @@
 # ccsx
-efficient tool for generating  circular consensus sequences (ccs) from subreads.
-Ccsx works with both x86-64 CPUs and ARM CPUs supporting the NEON instruction sets. 
-Efficiency are ensured through the use of bsalign(https://github.com/ruanjue/bsalign.git)
+efficient tool for generating  circular consensus sequences (ccs) from subreads. <br>
+Ccsx works with both x86-64 CPUs and ARM CPUs supporting the NEON instruction sets.  <br>
+Efficiency are ensured through the use of bsalign(https://github.com/ruanjue/bsalign.git) <br>
 
 # install
-git clone https://github.com/110allan/ccsx.git
-cd ccsx
-make
+git clone https://github.com/110allan/ccsx.git <br>
+cd ccsx <br>
+make <br>
 
 # usage
-Usage  : ccsx  [options] <INPUT> <OUTPUT>
-Generate circular consensus sequences (ccs) from subreads.
+Usage  : ccsx  [options] <INPUT> <OUTPUT> <br>
+Generate circular consensus sequences (ccs) from subreads. <br>
 
-Options:
--h             Output this help 
--v             debug 
--m     <int>   Minimum length of subreads to use for generating CCS. [10] 
--M     <int>   Maximum length of subreads to use for generating CCS. [50000] 
--c     <int>   Minimum number of subreads required to generate CCS. [3] 
--j     <int>   Number of threads to use, 0 means autodetection. [2] 
+Options:<br>
+-h             Output this help <br>
+-v             debug <br>
+-m     <int>   Minimum length of subreads to use for generating CCS. [10] <br>
+-M     <int>   Maximum length of subreads to use for generating CCS. [50000] <br>
+-c     <int>   Minimum number of subreads required to generate CCS. [3] <br>
+-j     <int>   Number of threads to use, 0 means autodetection. [2] <br>
 
-Arguments:
-input          Input bam file.
-output         Output fasta file.
+Arguments:<br>
+input          Input bam file.<br>
+output         Output fasta file.<br>
 
