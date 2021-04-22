@@ -1,7 +1,8 @@
 # ccsx
 efficient tool for generating  circular consensus sequences (ccs) from subreads. <br>
 Ccsx works with both x86-64 CPUs and ARM CPUs supporting the NEON instruction sets(https://github.com/DLTcollab/sse2neon.git).  <br>
-Efficiency are ensured through the use of bsalign(https://github.com/ruanjue/bsalign.git) <br>
+Efficiency is guaranteed with the use of bsalign(https://github.com/ruanjue/bsalign.git) <br>
+
 
 # install
 git clone https://github.com/110allan/ccsx.git <br>
