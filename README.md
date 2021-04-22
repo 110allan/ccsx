@@ -8,6 +8,7 @@ Efficiency is guaranteed with the use of bsalign(https://github.com/ruanjue/bsal
 git clone https://github.com/110allan/ccsx.git <br>
 cd ccsx <br>
 make <br>
+./ccsx<br>
 
 # usage
 Usage  : ccsx  [options] <INPUT> <OUTPUT> <br>
