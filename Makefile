@@ -7,6 +7,7 @@ ARCH = $(shell uname -p)
 ifeq ($(ARCH), x86_64)
 EXTRA_FLAGS=-msse4.2
 else ifeq ($(ARCH), aarch64)
+$(shell cd sse2neon; rm -rf [est]mmintrin.h ;ln -sf sse2neon.h emmintrin.h;ln -sf sse2neon.h smmintrin.h;ln -sf sse2neon.h tmmintrin.h)
 EXTRA_FLAGS=-fsigned-char -mabi=lp64 -Isse2neon
 endif
 
