@@ -5,9 +5,15 @@ Efficiency is guaranteed with the use of bsalign(https://github.com/ruanjue/bsal
 
 
 # install
+X86_64: <br>
 git clone https://github.com/110allan/ccsx.git <br>
-#arm64
-[git clone https://github.com/DLTcollab/sse2neon.git] <br>
+cd ccsx <br>
+make <br>
+./ccsx<br>
+
+ARM64:
+git clone https://github.com/110allan/ccsx.git <br>
+git clone https://github.com/DLTcollab/sse2neon.git <br>
 cd ccsx <br>
 make <br>
 ./ccsx<br>
