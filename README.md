@@ -11,7 +11,7 @@ cd ccsx <br>
 make <br>
 ./ccsx<br>
 
-ARM64:
+ARM64:<br>
 git clone https://github.com/110allan/ccsx.git <br>
 git clone https://github.com/DLTcollab/sse2neon.git <br>
 cd ccsx <br>
