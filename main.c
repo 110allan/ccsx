@@ -5,7 +5,7 @@
 #include "getopt.h"
 
 #include "dna.h"
-#include "filereader.h"
+
 #include "bsalign.h"
 #include "bspoa.h"
 #include <stdlib.h>
@@ -15,464 +15,579 @@
 #include "kthread.h"
 #include "kstring.h"
 #include "bamlite.h"
+#include "seqio.h"
+#include "khash.h"
 
-/*https://pacbiofileformats.readthedocs.io/en/9.0/BAM.html*/
-#define LCONTEXT_NULL (0)
-#define LCONTEXT_ADAPTER_BEFORE (1)
-#define LCONTEXT_ADAPTER_AFTER (2)
-#define LCONTEXT_BARCODE_AFTER (4)
-#define LCONTEXT_BARCODE_BEFORE (8)
-#define LCONTEXT_FORWARD_PASS (16)
-#define LCONTEXT_REVERSE_PASS (32)
-#define LCONTEXT_ADAPTER_BEFORE_BAD (64)
-#define LCONTEXT_ADAPTER_AFTER_BAD (128)
+KHASH_SET_INIT_STR(strset)
 
-
-#define MAX_MOVIE_NAME_LEN (1024)
-int8_t seq_comp_table[16] = { 0, 8, 4, 12, 2, 10, 6, 14, 1, 9, 5, 13, 3, 11, 7, 15 };
-const char seq_nt16_str[] = "=ACMGRSVTWYHKDBN";
-
-static char *get_read_seq(uint8_t *seq, int len, int breverse)
-{
-    int i, j;
-    char *s = calloc(1, len + 1);
-    if (s) {
-        if (breverse) {
-            for (i = 0, j = len - 1; i < len; i++, j--)
-                s[i] = seq_nt16_str[seq_comp_table[bam1_seqi(seq, j)]];
-        } else {
-            for (i = 0; i < len; i++)
-                s[i] = seq_nt16_str[bam1_seqi(seq, i)];
-        }
-    }
-    return s;
-}
+SEQIO_INIT(gzFile, gzread)
 
 void kt_for(int n_threads, void (*func)(void *, long, int), void *data, long n);
 void kt_pipeline(int n_threads, void *(*func)(void *, int, void *),
                  void *shared_data, int n_steps);
 
-typedef struct {
-    int min_subread_len, max_subread_len;
+typedef struct __pipeline_t
+{
+    size_t min_subread_len, max_subread_len;
     int min_fulllen_count;
     int verbose;
+    int split_subread;
     int nthreads;
     size_t chunk_size;
     FILE *fp_out;
-    bamFile fp_in;
+    kseqs_zmw_t zmw_seqs_in;
+    khash_t(strset) *hole_set;
     BSPOA **gg;     /*ccs comput ,per thread*/
-    BSPOA **lgg;     /*ccs comput ,per thread*/
 } pipeline_t;
 
-#define SEQ_PARTIAL  (1)
-#define SEQ_SHORT (2)
-#define SEQ_LONG (4)
-
-typedef struct {
-    uint32_t len;
-    uint8_t flags;
-    uint8_t *buf;
-} seq_t;
-
-typedef kvec_t(seq_t) vec_seq_t;
-typedef struct {
-    vec_seq_t seqs;
-    uint64_t hole;
-    int npass;
+typedef struct
+{
+    kstring_t movie_name, hole, seqs;
+    kvec_t(int) lens;
     kstring_t ccsseq;
 } zmw_t;
 
 static inline void zmw_initialize(zmw_t *zmw_p, int nseqs)
 {
-    zmw_p->hole = 0;
-    zmw_p->npass = 0;
-    kv_init(zmw_p->seqs);
-    kv_resize(seq_t, zmw_p->seqs, nseqs);
+    kv_init(zmw_p->lens);
+    kv_resize(int, zmw_p->lens, nseqs);
     zmw_p->ccsseq.m = zmw_p->ccsseq.l = 0, zmw_p->ccsseq.s = 0;
+    zmw_p->hole.m = zmw_p->hole.l = 0, zmw_p->hole.s = 0;
+    zmw_p->movie_name.m = zmw_p->movie_name.l = 0, zmw_p->movie_name.s = 0;
+    zmw_p->seqs.m = zmw_p->seqs.l = 0, zmw_p->seqs.s = 0;
+}
+
+static inline zmw_t *zmw_init(int nseqs)
+{
+    zmw_t *zmw_p = (zmw_t *)calloc(1, sizeof(zmw_t));
+    zmw_initialize(zmw_p, nseqs);
+    return zmw_p;
 }
 
 static inline void zmw_destroy(zmw_t *zmw_p)
 {
-    size_t i = 0;
+    if(!zmw_p)
+        return;
     char *s = NULL;
-    seq_t *seq;
-    for (i = 0; i < kv_size(zmw_p->seqs); ++i) {
-        seq = &kv_A(zmw_p->seqs, i);
-        free(seq->buf);
-    }
-
-    kv_destroy(zmw_p->seqs);
+    kv_destroy(zmw_p->lens);
     s = ks_release(&zmw_p->ccsseq);
+    free(s);
+    s = ks_release(&zmw_p->seqs);
+    free(s);
+    s = ks_release(&zmw_p->hole);
+    free(s);
+    s = ks_release(&zmw_p->movie_name);
     free(s);
 }
 
 typedef kvec_t(zmw_t) vec_zmw_t;
-typedef struct {
+typedef struct
+{
     vec_zmw_t zmws;     /*zmw seqs*/
     BSPOA **gg;          /*ccs comput ,per thread*/
-    BSPOA **lgg;          /*ccs comput ,per thread*/
+    int verbose;
 } step_t;
 
-static inline void step_initialize(step_t *step_p, int chunk_size)
+static inline step_t   *step_init(int chunk_size)
 {
-    step_p->gg = step_p->lgg = NULL;
-
+    step_t *step_p = calloc(1, sizeof(step_t));
+    step_p->gg = NULL;
     kv_init(step_p->zmws);
     kv_resize(zmw_t, step_p->zmws, chunk_size);
+    return step_p;
 }
 
 static inline void step_destroy(step_t *s)
 {
-        size_t i = 0;
-        for (i = 0; i < kv_size(s->zmws); ++i) {
-            zmw_t *zmw_p = &kv_A(s->zmws, i);
-            zmw_destroy(zmw_p);
-        }
-        kv_destroy(s->zmws);
+    size_t i = 0;
+    for(i = 0; i < kv_size(s->zmws); ++i)
+    {
+        zmw_t *zmw_p = &kv_A(s->zmws, i);
+        zmw_destroy(zmw_p);
+    }
+    kv_destroy(s->zmws);
+    if(s)
+    {
         free(s);
+        s = 0;
+    }
 }
 
-static void ccs_for(void *_data, long i, int tid) // kt_for() callback
+static void ccs_for(void *_data, long idx, int tid) // kt_for() callback
 {
+    size_t l;
     step_t *step = (step_t *)_data;
-    zmw_t *zmw_p = &kv_A(step->zmws, i);
-
+    zmw_t *zmw_p = &kv_A(step->zmws, idx);
     BSPOA *g = step->gg[tid];
-    BSPOA *lg = step->lgg[tid];
-
-    if (kv_size(zmw_p->seqs) < 3) {
+    if(kv_size(zmw_p->lens) < 3)
+    {
         return;
     }
 
-    beg_bspoa(g);
-
-    /*push seq */
-    size_t k;
-    seq_t *str;
-    for (k = 0; k < kv_size(zmw_p->seqs); ++k) {
-        str = &kv_A(zmw_p->seqs, k);
-        char *seq = get_read_seq(str->buf, str->len, k % 2);
-        if (!str->flags)
-            push_bspoa(g, seq, str->len);
-        free(seq);
+    int core_len = ks_len(&zmw_p->seqs) - kv_A(zmw_p->lens, 0) - kv_A(zmw_p->lens, kv_size(zmw_p->lens) - 1);
+    int averge_core_len = core_len / (kv_size(zmw_p->lens) - 2);
+    typedef struct
+    {
+        int offs;
+        int len;
+        char reverse;
+    } segment_t;
+    kvec_t(segment_t) segments;
+    kv_init(segments);
+    kv_resize(segment_t, segments, kv_size(zmw_p->lens));
+    segment_t seg;
+    int core_offset = 0;
+    int zmw_len;
+    for(l = 1; l < kv_size(zmw_p->lens) - 1; ++l)
+    {
+        zmw_len = kv_A(zmw_p->lens, l);
+        if(zmw_len < averge_core_len / 2)
+        {
+            core_offset += zmw_len;
+            continue;
+        }
+        else
+        {
+            seg.offs = core_offset + kv_A(zmw_p->lens, 0);
+            seg.len = (zmw_len > averge_core_len * 3 / 2) ? averge_core_len : zmw_len;
+            seg.reverse = (core_offset + seg.len / 2) / averge_core_len % 2;
+            kv_push(segment_t, segments, seg);
+        }
+        core_offset += zmw_len;
     }
 
+    //the first record
+    zmw_len = kv_A(zmw_p->lens, 0);
+    if(zmw_len > averge_core_len / 2)
+    {
+        seg.reverse = 1;
+        seg.len = zmw_len > averge_core_len ? averge_core_len : zmw_len;
+        seg.offs = 0;
+        kv_push(segment_t, segments, seg);
+    }
+
+
+    if(step->verbose > 1)
+        fprintf(stderr, "poa begin %s\n", ks_str(&zmw_p->hole));
+
+    beg_bspoa(g);
+    /*push seq */
+    segment_t *seg_p = NULL;
+    for(l = 0; l < kv_size(segments); ++l)
+    {
+        seg_p = &kv_A(segments, l);
+        if(seg_p->reverse)
+        {
+            seq_reverse_comp(seg_p->len, (unsigned char *)ks_str(&zmw_p->seqs) + seg_p->offs);
+        }
+
+        if(step->verbose)
+            fprintf(stderr, ">%s_%lu/%lu strand=%d len=%d \n%.*s\n",
+                    ks_str(&zmw_p->hole), l, kv_size(segments), seg_p->reverse, seg_p->len, seg_p->len, ks_str(&zmw_p->seqs) + seg_p->offs);
+        push_bspoa(g, ks_str(&zmw_p->seqs) + seg_p->offs, seg_p->len);
+    }
     end_bspoa(g);
-    remsa_bspoa(g, lg);
+
+    kv_destroy(segments);
 
     /*save ccs seq*/
     char *res = malloc(g->cns->size + 1);
-    for (k = 0; k < g->cns->size; ++k) {
-        res[k] = bit_base_table[g->cns->buffer[k]];
+    for(l = 0; l < g->cns->size; ++l)
+    {
+        res[l] = bit_base_table[g->cns->buffer[l]];
     }
-    res[k] = 0;
+    res[l] = 0;
     zmw_p->ccsseq.l = g->cns->size;
     zmw_p->ccsseq.m = g->cns->size + 1;
     zmw_p->ccsseq.s = res;
+
+    if(step->verbose > 1)
+        fprintf(stderr, "poa end %s\n", ks_str(&zmw_p->hole));
 }
 
 static void ccs_for2(void *_data, long idx, int tid) // kt_for() callback
 {
+    size_t l;
     step_t *step = (step_t *)_data;
     zmw_t *zmw_p = &kv_A(step->zmws, idx);
-
     BSPOA *g = step->gg[tid];
-    BSPOA *lg = step->lgg[tid];
-
-    if (kv_size(zmw_p->seqs) < 3) {
+    if(kv_size(zmw_p->lens) < 3)
+    {
         return;
     }
 
-    u4i nseq = 0;
-    String **seq = calloc(kv_size(zmw_p->seqs) ,sizeof(String *));
-
-    /*push seq */
-    size_t kidx;
-    for (kidx = 0; kidx < kv_size(zmw_p->seqs); ++kidx) {
-        seq_t *str = &kv_A(zmw_p->seqs, kidx);
-        char *read = get_read_seq(str->buf, str->len, kidx % 2);
-        if (!str->flags) {
-            seq[nseq ] = init_string(10240);
-            append_string(seq[nseq], read, str->len);
-	    nseq++;
+    int core_len = ks_len(&zmw_p->seqs) - kv_A(zmw_p->lens, 0) - kv_A(zmw_p->lens, kv_size(zmw_p->lens) - 1);
+    int averge_core_len = core_len / (kv_size(zmw_p->lens) - 2);
+    typedef struct
+    {
+        int offs;
+        int len;
+        char reverse;
+    } segment_t;
+    kvec_t(segment_t) segments;
+    kv_init(segments);
+    kv_resize(segment_t, segments, kv_size(zmw_p->lens));
+    segment_t seg;
+    int core_offset = 0;
+    int zmw_len;
+    for(l = 1; l < kv_size(zmw_p->lens); ++l)
+    {
+        zmw_len = kv_A(zmw_p->lens, l);
+        if(zmw_len < averge_core_len / 2)
+        {
+            core_offset += zmw_len;
+            continue;
         }
-        free(read);
+        else
+        {
+            seg.offs = core_offset + kv_A(zmw_p->lens, 0);
+            seg.len = (zmw_len > averge_core_len * 3 / 2) ? averge_core_len : zmw_len;
+            seg.reverse = (core_offset + seg.len / 2) / averge_core_len % 2;
+            kv_push(segment_t, segments, seg);
+        }
+        core_offset += zmw_len;
+    }
+    //the first record
+    zmw_len = kv_A(zmw_p->lens, 0);
+    if(zmw_len > averge_core_len / 2)
+    {
+        seg.reverse = 1;
+        seg.len = zmw_len > averge_core_len ? averge_core_len : zmw_len;
+        seg.offs = 0;
+        kv_push(segment_t, segments, seg);
     }
 
-    if(nseq<3) {
-        u4i i=0;
-    	for (i = 0; i < kv_size(zmw_p->seqs); i++) {
-        	if(seq[i]) free_string(seq[i]);
-    	}
-    	free(seq);
-        return;
+    u4i nseq = kv_size(segments);
+    String **seq = calloc(kv_size(segments), sizeof(String *));
+    segment_t *seg_p = NULL;
+    for(l = 0; l < kv_size(segments); ++l)
+    {
+        seg_p = &kv_A(segments, l);
+        if(seg_p->reverse)
+        {
+            seq_reverse_comp(seg_p->len, (unsigned char *)ks_str(&zmw_p->seqs) + seg_p->offs);
+        }
+        seq[l] = init_string(seg_p->len);
+        append_string(seq[l], ks_str(&zmw_p->seqs) + seg_p->offs, seg_p->len);
     }
-    //fprintf(stderr,"begin %lu\n",zmw_p->hole);	
-    u4i splitlen = 1000, minlen = 200, addlen = 1000, kmersize = 8;
-    float rowrate = 0.775, colrate = 0.8;
+
     zmw_p->ccsseq.l = zmw_p->ccsseq.m = 0, zmw_p->ccsseq.s = NULL;
     ks_resize(&zmw_p->ccsseq, 10000);
 
+
+
     //
-    u4i done, i, beg[nseq], len[nseq];
+    //fprintf(stderr, "split beg\n");
+    //
     char *str;
-    u4i j, k, off[nseq], off_nseq, ch_i, ch_nseq, k_off[nseq][kmersize], k_eq[nseq][kmersize], rowcnt, colcnt, rowtot, coltot, find;
-    //
-    done = 0;
-    for (i = 0; i < nseq; i++) {
-        beg[i] = 0;
-        len[i] = splitlen;
-        done = seq[i]->size - beg[i] < len[i] + minlen ? 1 : done;
+    int initlen, addlen, minlen, strcap, strsize, pushbeg[nseq], pushlen[nseq], flag;
+    double rowrate, colrate;
+    u1i *col;
+    u4i i, j, k, window, minwin, nogwin, mrow;
+    initlen = 1000;
+    addlen = 1000;
+    minlen = 200;
+    strcap = 0;
+    strsize = 0;
+    flag = 1;
+    rowrate = 0.8;
+    colrate = 0.8;
+    window = 10;
+    minwin = 5;
+    u4i rowcnt[nseq], colcnt[window], rowmin, colmin, rowidx, colidx, nogcol[window];
+    for(i = 0; i < nseq; i++)
+    {
+        pushbeg[i] = 0;
+        pushlen[i] = initlen;
+        if(strcap < seq[i]->size)
+        {
+            strcap = seq[i]->size;
+        }
+        if(pushbeg[i] + pushlen[i] + minlen > seq[i]->size)
+        {
+            flag = 0;
+        }
     }
-    for (i = 0; i < nseq; i++) {
-        len[i] = done == 1 ? seq[i]->size - beg[i] : len[i];
+    if(flag == 0)
+    {
+        for(i = 0; i < nseq; i++)
+        {
+            pushlen[i] = seq[i]->size - pushbeg[i];
+        }
     }
-    while (done == 0) {
+    strcap = strcap * 2;
+    str = (char *)calloc(strcap, sizeof(char));
+    while(flag == 1)
+    {
         beg_bspoa(g);
-        for (i = 0; i < nseq; i++) {
-            push_bspoa(g, seq[i]->string + beg[i], len[i]);
+        for(i = 0; i < nseq; i++)
+        {
+            /*fprintf(stderr, "seq%d %d %d ", i, pushbeg[i], pushlen[i]);
+            for(j = pushbeg[i]; j < pushbeg[i] + pushlen[i]; j++)
+            {
+                fprintf(stderr, "%c", seq[i]->string[j]);
+            }
+            fprintf(stderr, "\n");*/
+            push_bspoa(g, seq[i]->string + pushbeg[i], pushlen[i]);
         }
         end_bspoa(g);
-        remsa_bspoa(g, lg);
-        //print_msa_mline_bspoa(g, stdout);
-        str = str_msa_bspoa(g, g->strs);
-        //
-        j = g->msaidxs->size - 1;
-        for (i = 0; i < nseq; i++) {
-            off[i] = 0;
+        tidy_msa_bspoa(g);
+        mrow = nseq + 1 + 3;
+        for(i = g->msaidxs->size - window; i >= 1; i--)
+        {
+            col = g->msacols->buffer + g->msaidxs->buffer[i] * mrow;
+            if(col[nseq + 1] >= 4)
+            {
+                continue;
+            }
+            nogwin = 1;
+            for(j = i + 1; j < i + window; j++)
+            {
+                col = g->msacols->buffer + g->msaidxs->buffer[j] * mrow;
+                if(col[nseq + 1] < 4)
+                {
+                    nogwin++;
+                }
+            }
+            if(nogwin < minwin)
+            {
+                continue;
+            }
+            for(rowidx = 0; rowidx < nseq; rowidx++)
+            {
+                rowcnt[rowidx] = 0;
+            }
+            for(colidx = 0; colidx < window; colidx++)
+            {
+                colcnt[colidx] = 0;
+            }
+            for(j = i; j < i + window; j++)
+            {
+                colidx = j - i;
+                col = g->msacols->buffer + g->msaidxs->buffer[j] * mrow;
+                if(col[nseq + 1] < 4)
+                {
+                    for(k = 1; k <= nseq; k++)
+                    {
+                        rowidx = k - 1;
+                        if(col[k] == col[nseq + 1])
+                        {
+                            rowcnt[rowidx]++;
+                            colcnt[colidx]++;
+                        }
+                    }
+                    nogcol[colidx] = 1;
+                }
+                else
+                {
+                    nogcol[colidx] = 0;
+                }
+            }
+            /*for(j = i; j < i + window; j++)
+                        {
+                                col = g->msacols->buffer + g->msaidxs->buffer[j] * mrow;
+                                for(k = 1; k <= nseq; k++)
+                                {
+                                        fprintf(stderr, "%d", col[k]);
+                                }
+                                fprintf(stderr, "%d\n", col[nseq + 1]);
+                        }*/
+            rowmin = window;
+            for(rowidx = 0; rowidx < nseq; rowidx++)
+            {
+                //fprintf(stderr, "rowidx=%d, rowcnt[%d]=%d\n", rowidx, rowidx, rowcnt[rowidx]);
+                if(rowmin > rowcnt[rowidx])
+                {
+                    rowmin = rowcnt[rowidx];
+                }
+            }
+            colmin = nseq;
+            for(colidx = 0; colidx < window; colidx++)
+            {
+                //fprintf(stderr, "colidx=%d, colcnt[%d]=%d\n", colidx, colidx, colcnt[colidx]);
+                if(nogcol[colidx] == 1 && colmin > colcnt[colidx])
+                {
+                    colmin = colcnt[colidx];
+                }
+            }
+            //fprintf(stderr, "rowmin=%d/nogwin=%d, colmin=%d/nseq=%d\n", rowmin, nogwin, colmin, nseq);
+            if((float)rowmin / (float)nogwin >= rowrate && (float)colmin / (float)nseq >= colrate)
+            {
+                //fprintf(stderr, "yes\n");
+                break;
+            }
         }
-        off_nseq = 0;
-        //
-        for (k = 0; k < kmersize; k++) {
-            ch_nseq = 45;
-            for (; j > 0 && ch_nseq == 45; j--) {
-                ch_nseq = str[(nseq * (g->msaidxs->size + 1)) + j];
-                off_nseq = ch_nseq != 45 ? off_nseq + 1 : off_nseq;
-                for (i = 0; i < nseq; i++) {
-                    ch_i = str[(i * (g->msaidxs->size + 1)) + j];
-                    off[i] = ch_i != 45 ? off[i] + 1 : off[i];
-                    k_off[i][k] = off[i];
-                    k_eq[i][k] = ch_i == ch_nseq ? 1 : 0;
+        if(i >= 1)
+        {
+            for(j = 0; j < i; j++)
+            {
+                col = g->msacols->buffer + g->msaidxs->buffer[j] * mrow;
+                for(k = 1; k <= nseq; k++)
+                {
+                    if(col[k] < 4)
+                    {
+                        pushbeg[k - 1]++;
+                    }
+                }
+                if(col[nseq + 1] < 4)
+                {
+                    str[strsize] = bit_base_table[col[nseq + 1]];
+                    strsize++;
+                }
+            }
+            for(j = 0; j < nseq; j++)
+            {
+                pushlen[j] = initlen;
+                if(pushbeg[j] + pushlen[j] + minlen > seq[j]->size)
+                {
+                    flag = 0;
+                }
+            }
+            if(flag == 0)
+            {
+                for(j = 0; j < nseq; j++)
+                {
+                    pushlen[j] = seq[j]->size - pushbeg[j];
                 }
             }
         }
-        find = 1;
-        for (i = 0; i < nseq && find == 1; i++) {
-            rowcnt = 0;
-            for (k = 0; k < kmersize; k++) {
-                rowcnt = rowcnt + k_eq[i][k];
-            }
-            rowtot = kmersize;
-            for (k = 0; k <= kmersize - 2; k++) {
-                rowtot = k_off[i][k + 1] - k_off[i][k] >= 2 ? rowtot + k_off[i][k + 1] - k_off[i][k] - 1 : rowtot;
-            }
-            find = (float)rowcnt / (float)rowtot >= rowrate ? 1 : 0;
-        }
-        for (k = 0; k < kmersize && find == 1; k++) {
-            colcnt = 0;
-            for (i = 0; i < nseq; i++) {
-                colcnt = colcnt + k_eq[i][k];
-            }
-            coltot = nseq;
-            find = (float)colcnt / (float)coltot >= colrate ? 1 : 0;
-        }
-        //
-        while (j > 0 && find == 0) {
-            for (i = 0; i < nseq; i++) {
-                for (k = 0; k <= kmersize - 2; k++) {
-                    k_off[i][k] = k_off[i][k + 1];
-                    k_eq[i][k] = k_eq[i][k + 1];
+        else
+        {
+            for(j = 0; j < nseq; j++)
+            {
+                pushlen[j] = pushlen[j] + addlen;
+                if(pushbeg[j] + pushlen[j] + minlen > seq[j]->size)
+                {
+                    flag = 0;
                 }
             }
-            ch_nseq = 45;
-            for (; j > 0 && ch_nseq == 45; j--) {
-                ch_nseq = str[(nseq * (g->msaidxs->size + 1)) + j];
-                off_nseq = ch_nseq != 45 ? off_nseq + 1 : off_nseq;
-                for (i = 0; i < nseq; i++) {
-                    ch_i = str[(i * (g->msaidxs->size + 1)) + j];
-                    off[i] = ch_i != 45 ? off[i] + 1 : off[i];
-                    k_off[i][k] = off[i];
-                    k_eq[i][k] = ch_i == ch_nseq ? 1 : 0;
+            if(flag == 0)
+            {
+                for(j = 0; j < nseq; j++)
+                {
+                    pushlen[j] = seq[j]->size - pushbeg[j];
                 }
             }
-            find = 1;
-            for (i = 0; i < nseq && find == 1; i++) {
-                rowcnt = 0;
-                for (k = 0; k < kmersize; k++) {
-                    rowcnt = rowcnt + k_eq[i][k];
-                }
-                rowtot = kmersize;
-                for (k = 0; k <= kmersize - 2; k++) {
-                    rowtot = k_off[i][k + 1] - k_off[i][k] >= 2 ? rowtot + k_off[i][k + 1] - k_off[i][k] - 1 : rowtot;
-                }
-                find = (float)rowcnt / (float)rowtot >= rowrate ? 1 : 0;
-            }
-            for (k = 0; k < kmersize && find == 1; k++) {
-                colcnt = 0;
-                for (i = 0; i < nseq; i++) {
-                    colcnt = colcnt + k_eq[i][k];
-                }
-                coltot = nseq;
-                find = (float)colcnt / (float)coltot >= colrate ? 1 : 0;
-            }
         }
-        //
-        for (i = 0; i < nseq; i++) {
-            beg[i] = find == 1 ? beg[i] + len[i] - off[i] : beg[i];
-            len[i] = find == 0 ? len[i] + addlen : splitlen;
-            done = seq[i]->size - beg[i] < len[i] + minlen ? 1 : done;
-        }
-        for (i = 0; i < nseq; i++) {
-            len[i] = done == 1 ? seq[i]->size - beg[i] : len[i];
-        }
-        //
-        for (i = 0; i < g->cns->size - off_nseq && find == 1; i++) {
-            str[i] = bit_base_table[g->cns->buffer[i]];
-        }
-        str[i] = 0;
-        str[0] = find == 0 ? 0 : str[0];
-        kputs(str, &zmw_p->ccsseq);
     }
     beg_bspoa(g);
-    for (i = 0; i < nseq; i++) {
-        push_bspoa(g, seq[i]->string + beg[i], len[i]);
+    for(i = 0; i < nseq; i++)
+    {
+        /*fprintf(stderr, "seq%d %d %d ", i, pushbeg[i], pushlen[i]);
+        for(j = pushbeg[i]; j < pushbeg[i] + pushlen[i]; j++)
+        {
+            fprintf(stderr, "%c", seq[i]->string[j]);
+        }
+        fprintf(stderr, "\n");*/
+        push_bspoa(g, seq[i]->string + pushbeg[i], pushlen[i]);
     }
     end_bspoa(g);
-    remsa_bspoa(g, lg);
-    //print_msa_mline_bspoa(g, stdout);
-    str = str_msa_bspoa(g, g->strs);
-    for (i = 0; i < g->cns->size; i++) {
-        str[i] = bit_base_table[g->cns->buffer[i]];
+    tidy_msa_bspoa(g);
+    mrow = nseq + 1 + 3;
+    for(i = 0; i < g->msaidxs->size; i++)
+    {
+        col = g->msacols->buffer + g->msaidxs->buffer[i] * mrow;
+        if(col[nseq + 1] < 4)
+        {
+            str[strsize] = bit_base_table[col[nseq + 1]];
+            strsize++;
+        }
     }
-    str[i] = 0;
+    str[strsize] = 0;
+    //
+    //fprintf(stderr, "split end\n");
+    //
     kputs(str, &zmw_p->ccsseq);
-
-    for (i = 0; i < kv_size(zmw_p->seqs); i++) {
-        if(seq[i]) free_string(seq[i]);
+    free(str);
+    //destroy
+    for(i = 0; i < nseq; i++)
+    {
+        if(seq[i])
+            free_string(seq[i]);
     }
-    free(seq);    
+    free(seq);
+    kv_destroy(segments);
     //fprintf(stderr,"end %lu\n",zmw_p->hole);
 }
-
 
 static void *worker_pipeline(void *shared, int step, void *in) // kt_pipeline() callback
 {
     pipeline_t *p = (pipeline_t *)shared;
-    if (step == 0) { // step 0: read zmw into the buffer
-        step_t *s;
-        s = calloc(1, sizeof(step_t));
-        step_initialize(s, p->chunk_size);
+    if(step == 0)    // step 0: read zmw into the buffer
+    {
+        step_t *s = step_init(p->chunk_size);
+        s->verbose = p->verbose;
         s->gg = p->gg;
-        s->lgg = p->lgg;
+        kseqs_zmw_t *zmw_seqs = &p->zmw_seqs_in;
+        int l;
+        while((l = kseq_zmw_read(zmw_seqs)) >= 0)
+        {
+            if(l < p->min_fulllen_count + 2)
+                continue;
 
-        bam1_t *b = NULL;
-        int rc = 0;
-        zmw_t zmw;
-        int iseof;
-        int pre_zm = 0;
-        while (1) {
-            if (!b)
-                b = bam_init1();
-            if (b == NULL) {
-                fprintf(stderr, "Error: Failed to init BAM block!\n");
-                rc = -1;
+            size_t averge_len = (ks_len(&zmw_seqs->seqs) / kv_size(zmw_seqs->lens));
+            if(averge_len > p->max_subread_len || averge_len < p->min_subread_len)
+            {
+                continue;
+            }
+
+            if(p->hole_set)
+            {
+                khash_t(strset)* hole_set = p->hole_set;
+                if(kh_get(strset, hole_set, ks_str(&zmw_seqs->hole)) != kh_end(hole_set))
+                {
+                    continue;
+                }
+            }
+
+            zmw_t zmw;
+            zmw_initialize(&zmw, 8);
+            kputsn(ks_str(&zmw_seqs->hole), ks_len(&zmw_seqs->hole), &zmw.hole);
+            kputsn(ks_str(&zmw_seqs->movie_name), ks_len(&zmw_seqs->movie_name), &zmw.movie_name);
+            kputsn(ks_str(&zmw_seqs->seqs), ks_len(&zmw_seqs->seqs), &zmw.seqs);
+            kv_copy(int, zmw.lens, zmw_seqs->lens);
+            kv_push(zmw_t, s->zmws, zmw);
+            if(kv_size(s->zmws) >= p->chunk_size)
+            {
+                if(p->chunk_size < 16384)
+                {
+                    p->chunk_size *= 4;
+                }
                 break;
             }
-
-            if ((rc = bam_read1(p->fp_in, b)) < -1) {
-                fprintf(stderr, "Error: truncated file \n");
-                break;
-            } else if (rc == -1) {
-                iseof = 1;
-                if (!pre_zm)
-                    break;
-            } else {
-                iseof = 0;
-            }
-
-            int seq_len = 0, cx = 0, zm = 0;
-            if (!iseof) {
-                seq_len = b->core.l_qseq;
-                uint8_t *tag = NULL;
-                if ((tag = bam_aux_get(b, "cx")))
-                    cx = bam_aux2i(tag);
-                if ((tag = bam_aux_get(b, "zm")))
-                    zm = bam_aux2i(tag);
-            }
-
-            if (iseof || !pre_zm || pre_zm != zm) {
-                /*handle the old*/
-                if (pre_zm) {
-                    if (zmw.npass >= p->min_fulllen_count && zmw.npass && kv_size(zmw.seqs) >= 3)    {
-                        kv_push(zmw_t, s->zmws, zmw);
-                    }
-                    if (iseof || kv_size(s->zmws) >= p->chunk_size)
-                        break;
-                }
-
-                /*restart the new*/
-                if (!iseof) {
-                    pre_zm = zm;
-
-                    zmw_initialize(&zmw, 4);/*4 average*/
-                    zmw.npass = 0;
-                    zmw.hole = pre_zm;
-                }
-            }
-
-            if (!iseof) {
-                /*update the old*/
-                size_t buflen = (b->core.l_qseq + 1) >> 1;
-                seq_t seq = {b->core.l_qseq, 0, malloc(buflen)};
-                if (seq.buf) memcpy(seq.buf, bam1_seq(b), buflen);
-
-                if (cx & LCONTEXT_ADAPTER_AFTER && cx & LCONTEXT_ADAPTER_BEFORE) {
-                    zmw.npass++;
-                } else {
-                    seq.flags |= SEQ_PARTIAL;
-                }
-                if (seq_len < p->min_subread_len) {
-                    seq.flags |= SEQ_SHORT;
-                } else if (seq_len > p->max_subread_len) {
-                    seq.flags |= SEQ_LONG;
-                }
-
-                kv_push(seq_t, zmw.seqs, seq);
-                if (p->verbose) {
-                    size_t i, len = b->core.l_qseq;
-                    char *tmp = malloc(len + 1);
-                    for (i = 0; i < len; i++)
-                        tmp[i] = seq_nt16_str[bam1_seqi(bam1_seq(b), i)];
-                    tmp[len] = '\0';
-                    fprintf(stderr, ">%s\n%s\n", bam1_qname(b), tmp);
-                    free(tmp);
-                }
-            }
-
         }
 
-        if (b) {
-            bam_destroy1(b);
-            b = NULL;
-        }
-        if (kv_size(s->zmws))
+        if(kv_size(s->zmws))
             return s;
         else
             step_destroy(s);
-    } else if (step == 1) { // step 1: ccs
+    }
+    else if(step == 1)      // step 1: ccs
+    {
         step_t *s = (step_t *)in;
-        kt_for(p->nthreads, ccs_for, in, kv_size(s->zmws));
-        return in;
-    } else if (step == 2) { // step 2: write ccs seq to output
-        step_t *s = (step_t *)in;
-        size_t i = 0;
-        for (i = 0; i < kv_size(s->zmws); ++i) {
-            zmw_t *zmw_p = &kv_A(s->zmws, i);
-            fprintf(p->fp_out, ">%ld\n%s\n", zmw_p->hole, ks_str(&zmw_p->ccsseq));
-            zmw_destroy(zmw_p);
+        if(s)
+        {
+            if(p->split_subread)
+                kt_for(p->nthreads, ccs_for2, in, kv_size(s->zmws));
+            else
+                kt_for(p->nthreads, ccs_for, in, kv_size(s->zmws));
         }
-        kv_destroy(s->zmws);
-        free(s);
+        return in;
+    }
+    else if(step == 2)      // step 2: write ccs seq to output
+    {
+        step_t *s = (step_t *)in;
+        if(s)
+        {
+            size_t i = 0;
+            for(i = 0; i < kv_size(s->zmws); ++i)
+            {
+                zmw_t *zmw_p = &kv_A(s->zmws, i);
+                if(ks_len(&zmw_p->ccsseq))
+                    fprintf(p->fp_out, ">%s/%s/ccs\n%s\n", ks_str(&zmw_p->movie_name), ks_str(&zmw_p->hole), ks_str(&zmw_p->ccsseq));
+            }
+            step_destroy(s);
+        }
     }
     return 0;
 }
@@ -492,7 +607,10 @@ static int usage()
             "-m     <int>   Minimum length of subreads to use for generating CCS. [10] \n"
             "-M     <int>   Maximum length of subreads to use for generating CCS. [50000] \n"
             "-c     <int>   Minimum number of subreads required to generate CCS. [3] \n"
-            "-j     <int>   Number of threads to use, 0 means autodetection. [2] \n"
+            "-A             For fasta/fastq input,gzip allowed  \n"
+            "-P             primitive bsalign,subread shred by default \n"
+            "-X		<str>   Exclude ZMWs from output file,a comma-separated list of ID \n"
+            "-j     <int>   Number of threads to use. [2] \n"
             "\n"
             "Arguments:\n"
             "input          Input file.\n"
@@ -506,19 +624,45 @@ static int usage()
 int main(int argc, char **const argv)
 {
     int c, verbose = 0, min_subread_len = 10, max_subread_len = 50000,
-           min_fulllen_count = 3, nthreads = 1;
-    while ((c = getopt(argc, argv, "hm:M:c:j:v")) != -1) {
-        switch (c) {
+           min_fulllen_count = 3, nthreads = 1, isbam = 1, split_subread = 1;
+
+    khash_t(strset)* hole_set = NULL;
+    kstring_t strholes = {0};
+    while((c = getopt(argc, argv, "hm:M:c:j:X:PAv")) != -1)
+    {
+        switch(c)
+        {
             case 'm':
                 min_subread_len = atoi(optarg);
                 break;
             case 'M':
                 max_subread_len = atoi(optarg);
                 break;
+            case 'P':
+                split_subread = 0;
+                break;
+            case 'A':
+                isbam = 0;/*fasta/q*/
+                break;
+            case 'X':
+            {
+                kputs(optarg, &strholes);
+                int n, i, *fields;
+                fields = ksplit(&strholes, ',', &n);
+                hole_set = kh_init(strset); // allocate a hash table
+                for(i = 0; i < n; ++i)
+                {
+                    int ret;
+                    kh_put(strset, hole_set, ks_str(&strholes) + fields[i], &ret);
+                }
+                free(fields);
+            }
+            break;
             case 'c':
                 min_fulllen_count = atoi(optarg);
-                if (min_fulllen_count < 1) {
-                    fprintf(stderr, "Error! min fulllen count=[%d] (>=1) !\n", min_fulllen_count);
+                if(min_fulllen_count < 3)
+                {
+                    fprintf(stderr, "Error! min fulllen count=[%d] (>=3) !\n", min_fulllen_count);
                     return -1;
                 }
                 break;
@@ -533,47 +677,55 @@ int main(int argc, char **const argv)
         }
     }
 
-    char *infile;
     FILE *fp_out = NULL;
-
-    if (argc - optind == 1) {
-        infile = argv[optind];
-        fp_out = open_file_for_write("-", NULL, 1);;
-    } else if (argc - optind == 2) {
-        infile = argv[optind];
-        fp_out = open_file_for_write(argv[optind + 1], NULL, 1);
-    } else {
+    gzFile fp_in;
+    if(argc - optind == 0)
+    {
+        fp_in = gzdopen(fileno(stdin), "rb") ;
+        fp_out = stdout;
+    }
+    else if(argc - optind == 1)
+    {
+        fp_in = (strcmp(argv[optind], "-") == 0) ? gzdopen(fileno(stdin), "rb") : gzopen(argv[optind], "rb");
+        fp_out = stdout;
+    }
+    else if(argc - optind == 2)
+    {
+        fp_in = (strcmp(argv[optind], "-") == 0) ? gzdopen(fileno(stdin), "rb") : gzopen(argv[optind], "rb");
+        fp_out = (strcmp(argv[optind + 1], "-") == 0) ? stdout : fopen(argv[optind + 1], "w+");
+    }
+    else
+    {
         return usage();
     }
 
-    /*read bam file*/
-    bamFile fp_in = bam_open(infile, "rb");
-    if (!fp_in) {
-        fprintf(stderr, "Error: Failed to open '%s'!\n", argv[1]);
+    /*read infile*/
+    if(!fp_in)
+    {
+        fprintf(stderr, "Error: Failed to open infile!\n");
         return 1;
     }
 
-    bam_header_t  *hdr = bam_header_read(fp_in);
-    if (!hdr) {
-        fprintf(stderr, "Error: Failed to read BAM head!\n");
-        bam_close(fp_in);
+    if(!fp_out)
+    {
+        fprintf(stderr, "Cannot open file for write!\n");
         return 1;
     }
-    bam_header_destroy(hdr);
 
     pipeline_t pl;
     pl.max_subread_len = max_subread_len;
     pl.min_subread_len = min_subread_len;
     pl.min_fulllen_count = min_fulllen_count;
     pl.nthreads = nthreads;
-    pl.chunk_size = 10240;
-    pl.fp_in = fp_in;
+    pl.chunk_size = 1024;
+    pl.split_subread = split_subread;
     pl.fp_out = fp_out;
     pl.verbose = verbose;
+    pl.hole_set = hole_set;
     int i = 0;
     pl.gg = calloc(nthreads, sizeof(BSPOA *));
-    pl.lgg = calloc(nthreads, sizeof(BSPOA *));
-    for (i = 0; i < nthreads; ++i) {
+    for(i = 0; i < nthreads; ++i)
+    {
         BSPOAPar par = DEFAULT_BSPOA_PAR;
         par.M = 2;
         par.X = -6;
@@ -581,27 +733,25 @@ int main(int argc, char **const argv)
         par.E = -2;
         par.Q = 0;
         par.P = 0;
-        par.bwtrigger = 10;
         pl.gg[i] = init_bspoa(par);
-
-        BSPOAPar rpar = DEFAULT_BSPOA_PAR;
-        rpar.M = 1;
-        rpar.X = -2;
-        rpar.O = 0;
-        rpar.E = -1;
-        rpar.Q = 0;
-        rpar.P = 0;
-        pl.lgg[i] = init_bspoa(rpar);
     }
-    kt_pipeline(nthreads, worker_pipeline, &pl, 3);
-    for (i = 0; i < nthreads; ++i) {
+
+    kseqs_zmw_initialize(&pl.zmw_seqs_in, fp_in, isbam);
+
+    kt_pipeline(2, worker_pipeline, &pl, 3);
+    for(i = 0; i < nthreads; ++i)
+    {
         free_bspoa(pl.gg[i]);
-        free_bspoa(pl.lgg[i]);
     }
-    free(pl.gg);free(pl.lgg);
-
+    free(pl.gg);
+    zmw_seqs_release(&pl.zmw_seqs_in);
+    if(pl.hole_set)
+    {
+        kh_destroy(strset, hole_set);
+    }
+    free(ks_release(&strholes));
     fclose(fp_out);
-    bam_close(fp_in);
+    gzclose(fp_in);
+
     return 0;
 }
-
