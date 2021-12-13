@@ -8,29 +8,35 @@ Efficiency is guaranteed with the use of bsalign(https://github.com/ruanjue/bsal
 X86_64: <br>
 git clone https://github.com/110allan/ccsx.git <br>
 cd ccsx <br>
+git clone  https://github.com/ruanjue/bsalign.git <br>
 make <br>
 ./ccsx<br>
 
 ARM64:<br>
 git clone https://github.com/110allan/ccsx.git <br>
-git clone https://github.com/DLTcollab/sse2neon.git <br>
 cd ccsx <br>
+git clone https://github.com/DLTcollab/sse2neon.git <br>
+git clone  https://github.com/ruanjue/bsalign.git <br>
 make <br>
 ./ccsx<br>
 
 # usage
 Usage  : ccsx  [options] <INPUT> <OUTPUT> <br>
-Generate circular consensus sequences (ccs) from subreads. <br>
-
+Generate circular consensus sequences (ccs) from subreads.<br>
+<br>
 Options:<br>
 -h             Output this help <br>
 -v             debug <br>
 -m     <int>   Minimum length of subreads to use for generating CCS. [10] <br>
 -M     <int>   Maximum length of subreads to use for generating CCS. [50000] <br>
 -c     <int>   Minimum number of subreads required to generate CCS. [3] <br>
--j     <int>   Number of threads to use, 0 means autodetection. [2] <br>
-
+-A             For fasta/fastq input,gzip allowed  <br>
+-P             primitive bsalign,subread shred by default <br>
+-X	<str>   Exclude ZMWs from output file,a comma-separated list of ID <br>
+-j     <int>   Number of threads to use. [2] <br>
+<br>
 Arguments:<br>
-input          Input bam file.<br>
-output         Output fasta file.<br>
+input          Input file.<br>
+output         Output file.<br>
+
 
