@@ -10,7 +10,7 @@ git clone https://github.com/110allan/ccsx.git <br>
 cd ccsx <br>
 git clone  https://github.com/ruanjue/bsalign.git <br>
 make <br>
-./ccsx<br>
+./ccsx -h <br>
 
 ARM64:<br>
 git clone https://github.com/110allan/ccsx.git <br>
@@ -18,7 +18,7 @@ cd ccsx <br>
 git clone https://github.com/DLTcollab/sse2neon.git <br>
 git clone  https://github.com/ruanjue/bsalign.git <br>
 make <br>
-./ccsx<br>
+./ccsx -h <br>
 
 # usage
 Usage  : ccsx  [options] <INPUT> <OUTPUT> <br>
