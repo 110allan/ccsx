@@ -5,12 +5,15 @@ CC  := gcc
 
 ARCH = $(shell uname -p)
 ifeq ($(ARCH), x86_64)
+ifeq (1, ${AVX2})
+EXTRA_FLAGS=-mavx2 -mavx
+else
 EXTRA_FLAGS=-msse4.2
+endif
 else ifeq ($(ARCH), aarch64)
 $(shell cd sse2neon; rm -rf [est]mmintrin.h ;ln -sf sse2neon.h emmintrin.h;ln -sf sse2neon.h smmintrin.h;ln -sf sse2neon.h tmmintrin.h)
 EXTRA_FLAGS=-fsigned-char -mabi=lp64 -Isse2neon
 endif
-
 
 
 ifeq (1, ${DEBUG})
