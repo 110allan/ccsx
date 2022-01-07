@@ -40,5 +40,5 @@ $(PROGS): $(obj)
 
 .PHONY:clean
 clean:
-	rm -rf $(obj) $(PROGS) bsalign/{*.o,bsalign} 
+	rm -rf $(obj) $(PROGS) 
 
