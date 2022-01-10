@@ -27,12 +27,12 @@ Generate circular consensus sequences (ccs) from subreads.<br>
 Options:<br>
 -h             Output this help <br>
 -v             debug <br>
--m     <int>   Minimum length of subreads to use for generating CCS. [10] <br>
--M     <int>   Maximum length of subreads to use for generating CCS. [50000] <br>
+-m     <int>   Minimum total length of subreads in a hole to use for generating CCS. [5000] <br>
+-M     <int>   Maximum total length of subreads in a hole to use for generating CCS. [500000] <br>
 -c     <int>   Minimum number of subreads required to generate CCS. [3] <br>
 -A             For fasta/fastq input,gzip allowed  <br>
 -P             primitive bsalign,subread shred by default <br>
--X	<str>   Exclude ZMWs from output file,a comma-separated list of ID <br>
+-X	   <str>   Exclude ZMWs from output file,a comma-separated list of ID <br>
 -j     <int>   Number of threads to use. [2] <br>
 <br>
 Arguments:<br>
